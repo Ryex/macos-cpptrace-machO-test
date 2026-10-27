@@ -1,0 +1,104 @@
+name: Build macOS universal binary
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-universal:
+    name: macOS universal (x86_64 + arm64)
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Toolchain information
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          xcodebuild -version
+          cmake --version
+          echo "SDK: $(xcrun --show-sdk-path)"
+          echo "SDK version: $(xcrun --show-sdk-version)"
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMACOS_TRACE_UNIVERSAL=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCPPTRACE_BUILD_SHARED=OFF \
+            -DCPPTRACE_USE_EXTERNAL_LIBDWARF=OFF \
+            -DCPPTRACE_USE_EXTERNAL_ZSTD=OFF
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cmake --build build --config Release --parallel
+
+      - name: Verify universal and static linkage
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary=build/macos_mach_trace
+
+          test -x "$binary"
+          test -f build/third_party/cpptrace/libcpptrace.a
+
+          archs="$(lipo -archs "$binary")"
+          echo "Architectures: $archs"
+          echo "$archs" | grep -qw x86_64
+          echo "$archs" | grep -qw arm64
+
+          for arch in x86_64 arm64; do
+            echo "--- $arch dynamic dependencies ---"
+            otool -arch "$arch" -L "$binary"
+            if otool -arch "$arch" -L "$binary" | grep -Eiq '(cpptrace|libdwarf|libzstd)'; then
+              echo "error: cpptrace/libdwarf/libzstd is dynamically linked in the $arch slice" >&2
+              exit 1
+            fi
+          done
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp build/macos_mach_trace dist/
+
+          files=(macos_mach_trace)
+          if [ -d build/macos_mach_trace.dSYM ]; then
+            cp -R build/macos_mach_trace.dSYM dist/
+            files+=(macos_mach_trace.dSYM)
+          fi
+
+          tar -czf dist/macos_mach_trace-universal.tar.gz -C dist "${files[@]}"
+          (
+            cd dist
+            shasum -a 256 macos_mach_trace macos_mach_trace-universal.tar.gz > SHA256SUMS
+          )
+
+          ls -la dist
+          cat dist/SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-mach-trace-universal
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
